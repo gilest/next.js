@@ -176,10 +176,6 @@ impl CleanupOldEdgesOperation {
                                 ) = dep.into_parts();
                                 {
                                     let mut task = ctx.task(cell_task_id, TaskDataCategory::Data);
-                                    // The `cell_dependents` set on the dependee task is keyed
-                                    // by `(cell, task_id, key)`. Re-encode that as a
-                                    // `CellDependency` whose `CellRef.task` is the dependent
-                                    // task — same bits, opposite direction.
                                     task.remove_cell_dependents(&CellDependency::new(
                                         CellRef {
                                             task: task_id,

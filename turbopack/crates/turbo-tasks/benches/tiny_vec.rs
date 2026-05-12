@@ -45,7 +45,7 @@ fn push_vec(n: usize) -> Vec<Item> {
 }
 
 fn push_tinyvec(n: usize) -> TinyVec<Item> {
-    let mut v: TinyVec<Item> = TinyVec::new();
+    let mut v: TinyVec<Item> = TinyVec::default();
     for i in 0..n {
         v.push(make_item(i as u64));
     }

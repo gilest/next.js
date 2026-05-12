@@ -138,8 +138,6 @@ impl UpdateCellOperation {
                 FxIndexMap::default();
             if !skip_invalidation {
                 let tasks_with_keys = task.iter_cell_dependents().filter_map(|dep| {
-                    // `cell_dependents` reuses `CellDependency`, but with the dependent task
-                    // stored in `CellRef.task` and the storing task's cell in `CellRef.cell`.
                     let (
                         CellRef {
                             task: dependent_task,

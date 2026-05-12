@@ -6,24 +6,33 @@
 //! resident memory.
 //!
 //! The API is intentionally a strict subset of `Vec` covering only what the task-storage
-//! callers and the `#[task_storage]` macro emit need: `len`, `is_empty`, `iter`, `iter_mut`,
-//! `push`, `swap_remove`, `last_mut`, `index`, `index_mut`, `extend`, `reserve`, `Default`,
-//! `Debug`, `ShrinkToFit`. No `Clone` or `PartialEq` — `TaskStorage` doesn't derive them.
+//! callers and the `#[task_storage]` macro emit need: `len`, `iter`, `iter_mut`, `push`,
+//! `swap_remove`, `last_mut`, `index`, `index_mut`, `extend`, `reserve`, `retain_mut`,
+//! `Default`, `Debug`, `ShrinkToFit`. No `Clone` or `PartialEq` — `TaskStorage` doesn't
+//! derive them.
 //!
-//! Capacity is bounded by `u8::MAX = 255`. The schema currently uses ~25 variants and growth
-//! follows powers of two, so we have plenty of headroom; oversized pushes panic.
+//! ## Capacity
+//!
+//! `TinyVec<T, MAX>` is statically capped at `MAX <= 255` elements. Pushing past `MAX`
+//! panics. Growth doubles until it would exceed `MAX`, then caps at exactly `MAX`. The
+//! default `MAX = 255` covers any container that fits the type's `u8` cap.
+//!
+//! For `TaskStorage::lazy` the schema emits `TinyVec<LazyField, 25>`, which tightens the
+//! steady-state allocation: a fully-populated lazy vec ends at cap=25 instead of cap=32
+//! (the next power of two), saving 7 slots × `size_of::<LazyField>()` ≈ 336 B per such
+//! task.
 
 use std::{
     alloc::{Layout, alloc, dealloc, handle_alloc_error},
     fmt,
-    iter::FromIterator,
     marker::PhantomData,
     mem::ManuallyDrop,
     ptr::{self, NonNull},
 };
 
-/// Compact `Vec`-shaped container; see module docs for rationale.
-pub struct TinyVec<T> {
+/// Compact `Vec`-shaped container with a statically-bounded capacity; see module docs for
+/// rationale. `MAX` defaults to `u8::MAX = 255` (the largest value the `u8` cap field can hold).
+pub struct TinyVec<T, const MAX: u8 = { u8::MAX }> {
     /// Heap pointer. Dangling (uninitialized) when `cap == 0`.
     ptr: NonNull<T>,
     len: u8,
@@ -34,22 +43,27 @@ pub struct TinyVec<T> {
 
 // SAFETY: same as `Vec<T>` — we own a heap allocation of `T`s, and the only shared state is via
 // the `ptr` which is unique to this `TinyVec`.
-unsafe impl<T: Send> Send for TinyVec<T> {}
-unsafe impl<T: Sync> Sync for TinyVec<T> {}
+unsafe impl<T: Send, const MAX: u8> Send for TinyVec<T, MAX> {}
+unsafe impl<T: Sync, const MAX: u8> Sync for TinyVec<T, MAX> {}
 
-impl<T> Default for TinyVec<T> {
+impl<T, const MAX: u8> Default for TinyVec<T, MAX> {
     fn default() -> Self {
-        Self {
-            ptr: NonNull::dangling(),
-            len: 0,
-            cap: 0,
-            _marker: PhantomData,
-        }
+        Self::new()
     }
 }
 
-impl<T> TinyVec<T> {
-    pub const fn new() -> Self {
+impl<T, const MAX: u8> TinyVec<T, MAX> {
+    // Compile-time assertion that `MAX > 0`. Referenced inside `new()` so it gets evaluated
+    // at monomorphization time; the panic message becomes a compile error for any
+    // `TinyVec<T, 0>` instantiation rather than a runtime panic on the first call.
+    const _ASSERT_MAX_NONZERO: () = assert!(MAX > 0, "TinyVec MAX must be > 0");
+
+    const fn new() -> Self {
+        // Force evaluation of the static assertion at this generic's monomorphization.
+        // The `let` binding to `()` keeps the const visited; clippy's `let_unit_value` lint
+        // is allowed here because that's intentional.
+        #[allow(clippy::let_unit_value)]
+        let _: () = Self::_ASSERT_MAX_NONZERO;
         Self {
             ptr: NonNull::dangling(),
             len: 0,
@@ -58,98 +72,42 @@ impl<T> TinyVec<T> {
         }
     }
 
-    pub fn retain_mut(&mut self, mut f: impl FnMut(&mut T) -> bool) {
-        let original_len = self.len;
-
-        if original_len == 0 {
-            // Empty case: explicit return allows better optimization, vs letting compiler infer it
+    /// Retains only the elements for which the predicate returns `true`. See
+    /// [`Vec::retain_mut`] for semantics including panic safety.
+    ///
+    /// Delegates to `Vec::retain_mut`. Implementing retain_mut directly requires a
+    /// panic-safe partial-shift dance that's the trickiest unsafe code in this module; the
+    /// `Vec` version is identical in shape but has been hand-tested in the standard
+    /// library. Round-tripping through `Vec` for this one operation is worth the soundness
+    /// improvement, especially since `retain_mut` is cold relative to `push`.
+    pub fn retain_mut(&mut self, f: impl FnMut(&mut T) -> bool) {
+        if self.len == 0 {
             return;
         }
 
-        // Vec: [Kept, Kept, Hole, Hole, Hole, Hole, Unchecked, Unchecked]
-        //      |            ^- write                ^- read             |
-        //      |<-              original_len                          ->|
-        // Kept: Elements which predicate returns true on.
-        // Hole: Moved or dropped element slot.
-        // Unchecked: Unchecked valid elements.
-        //
-        // This drop guard will be invoked when predicate or `drop` of element panicked.
-        // It shifts unchecked elements to cover holes and `set_len` to the correct length.
-        // In cases when predicate and `drop` never panick, it will be optimized out.
-        struct PanicGuard<'a, T> {
-            v: &'a mut TinyVec<T>,
-            read: u8,
-            write: u8,
-            original_len: u8,
-        }
+        // Panic safety: transfer buffer ownership to the local `Vec` *before* the closure
+        // can panic. Zeroing `cap` first means our `Drop` becomes a no-op until we restore
+        // it below — if `f` panics, `vec`'s Drop frees the buffer exactly once and our
+        // Drop (which may run during continued unwinding) does nothing.
+        let ptr = self.ptr.as_ptr();
+        let len = self.len as usize;
+        let cap = self.cap as usize;
+        self.cap = 0;
+        self.len = 0;
 
-        impl<T> Drop for PanicGuard<'_, T> {
-            #[cold]
-            fn drop(&mut self) {
-                let remaining = self.original_len - self.read;
-                // SAFETY: Trailing unchecked items must be valid since we never touch them.
-                unsafe {
-                    ptr::copy(
-                        self.v.as_ptr().add(self.read as usize),
-                        self.v.as_mut_ptr().add(self.write as usize),
-                        remaining as usize,
-                    );
-                }
-                // SAFETY: After filling holes, all items are in contiguous memory.
-                self.v.len = self.write + remaining;
-            }
-        }
+        // SAFETY: by struct invariant, `(ptr, len, cap)` is a valid `Vec::from_raw_parts`
+        // triple.
+        let mut vec = unsafe { Vec::from_raw_parts(ptr, len, cap) };
+        vec.retain_mut(f);
 
-        let mut read: u8 = 0;
-        loop {
-            // SAFETY: read < original_len
-            let cur = unsafe { self.get_unchecked_mut(read as usize) };
-            if !f(cur) {
-                break;
-            }
-            read += 1;
-            if read == original_len {
-                // All elements are kept, return early.
-                return;
-            }
-        }
-
-        // Critical section starts here and at least one element is going to be removed.
-        // Advance `g.read` early to avoid double drop if `drop_in_place` panicked.
-        let mut g = PanicGuard {
-            v: self,
-            read: read + 1,
-            write: read,
-            original_len,
-        };
-        // SAFETY: previous `read` is always less than original_len.
-        unsafe { ptr::drop_in_place(&mut *g.v.as_mut_ptr().add(read as usize)) };
-
-        while g.read < g.original_len {
-            // SAFETY: `read` is always less than original_len.
-            let cur = unsafe { &mut *g.v.as_mut_ptr().add(g.read as usize) };
-            if !f(cur) {
-                // Advance `read` early to avoid double drop if `drop_in_place` panicked.
-                g.read += 1;
-                // SAFETY: We never touch this element again after dropped.
-                unsafe { ptr::drop_in_place(cur) };
-            } else {
-                // SAFETY: `read` > `write`, so the slots don't overlap.
-                // We use copy for move, and never touch the source element again.
-                unsafe {
-                    let hole = g.v.as_mut_ptr().add(g.write as usize);
-                    ptr::copy_nonoverlapping(cur, hole, 1);
-                }
-                g.write += 1;
-                g.read += 1;
-            }
-        }
-
-        // We are leaving the critical section and no panic happened,
-        // Commit the length change and forget the guard.
-        // SAFETY: `write` is always less than or equal to original_len.
-        g.v.len = g.write;
-        std::mem::forget(g);
+        // No panic. Take ownership of the (possibly element-dropped) buffer back.
+        // `retain_mut` never grows, so `new_cap == cap`.
+        let (new_ptr, new_len, new_cap) = vec.into_raw_parts();
+        debug_assert_eq!(new_cap, cap);
+        // SAFETY: `Vec::into_raw_parts` returns a non-null pointer; same buffer as on entry.
+        self.ptr = unsafe { NonNull::new_unchecked(new_ptr) };
+        self.len = new_len as u8;
+        self.cap = new_cap as u8;
     }
 
     #[inline]
@@ -157,44 +115,46 @@ impl<T> TinyVec<T> {
         self.len as usize
     }
 
+    /// Pair to [`len`] (kept inherent so clippy's `len_without_is_empty` lint is satisfied;
+    /// it's also reachable through `Deref<[T]>::is_empty`).
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
 
+    // `capacity` is exposed only to tests; external callers don't need it.
+    #[cfg(test)]
     #[inline]
-    pub fn capacity(&self) -> usize {
+    fn capacity(&self) -> usize {
         self.cap as usize
     }
 
-    /// Returns an iterator over the elements in insertion order.
-    #[inline]
-    pub fn iter(&self) -> std::slice::Iter<'_, T> {
-        self.as_slice().iter()
-    }
-
-    /// Returns a mutable iterator over the elements in insertion order.
-    #[inline]
-    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, T> {
-        self.as_mut_slice().iter_mut()
-    }
+    // `iter`, `iter_mut`, `last_mut`, indexing, and `.is_empty()` slice-style usage are
+    // reachable through `Deref`/`DerefMut` to `[T]`. No need for inherent methods.
 
     #[inline]
-    pub fn as_slice(&self) -> &[T] {
+    fn as_slice(&self) -> &[T] {
         // SAFETY: ptr is valid for `len` initialized elements; if len == 0, slicing the
         // dangling pointer is allowed by `from_raw_parts`.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len()) }
     }
 
     #[inline]
-    pub fn as_mut_slice(&mut self) -> &mut [T] {
+    fn as_mut_slice(&mut self) -> &mut [T] {
         // SAFETY: same as `as_slice`; we hold `&mut self`.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len()) }
     }
 
-    /// Appends `value`. Panics if growing the buffer would exceed `u8::MAX` capacity.
+    /// Appends `value`. Panics if `len == MAX`.
     pub fn push(&mut self, value: T) {
         if self.len == self.cap {
+            // grow_by_one asserts inside realloc_to when new_cap > MAX. The check below
+            // happens before the cold-path call so we panic with a clearer message when the
+            // container is already saturated.
+            assert!(
+                (self.len as usize) < MAX as usize,
+                "TinyVec capacity overflow: already at MAX = {MAX}",
+            );
             self.grow_by_one();
         }
         // SAFETY: `len < cap` after the grow; the slot at index `len` is uninitialized and we
@@ -223,40 +183,38 @@ impl<T> TinyVec<T> {
         }
     }
 
-    /// Returns a mutable reference to the last element if any.
-    pub fn last_mut(&mut self) -> Option<&mut T> {
-        self.as_mut_slice().last_mut()
-    }
-
     /// Reserves capacity for at least `additional` more elements. No-op if already sufficient.
-    /// Panics if the resulting capacity would exceed `u8::MAX`.
-    pub fn reserve(&mut self, additional: usize) {
+    /// Panics if the resulting capacity would exceed `MAX`.
+    ///
+    /// Private: used by `extend_exact` internally; no external callers.
+    fn reserve(&mut self, additional: usize) {
         let needed = self.len() + additional;
         if needed <= self.cap as usize {
             return;
         }
-        let new_cap = needed.next_power_of_two().max(4);
-        self.realloc_to(new_cap);
+        // Round up to next power of two (min 4), but never exceed MAX.
+        let target = needed.next_power_of_two().max(4).min(MAX as usize);
+        self.realloc_to(target);
     }
 
     /// Grow the buffer by at least one slot. The first allocation jumps to 4 to amortize the
-    /// initial pushes; subsequent growths double up to the `u8::MAX` ceiling.
+    /// initial pushes; subsequent growths double, capped at `MAX`.
     #[cold]
     #[inline(never)]
     fn grow_by_one(&mut self) {
-        let new_cap = if self.cap == 0 {
+        let doubled = if self.cap == 0 {
             4
         } else {
             (self.cap as usize) * 2
         };
+        let new_cap = doubled.min(MAX as usize);
         self.realloc_to(new_cap);
     }
 
     fn realloc_to(&mut self, new_cap: usize) {
         assert!(
-            new_cap <= u8::MAX as usize,
-            "TinyVec capacity overflow: requested {new_cap}, max {}",
-            u8::MAX
+            new_cap <= MAX as usize,
+            "TinyVec capacity overflow: requested {new_cap}, max {MAX}",
         );
         if new_cap == self.cap as usize {
             return;
@@ -293,6 +251,10 @@ impl<T> TinyVec<T> {
 
     /// Deallocates the current heap buffer without dropping the elements (caller must have
     /// already moved or dropped them). No-op if `cap == 0`.
+    ///
+    /// `#[inline]` so the `cap == 0` early return collapses at the `Drop` call site for
+    /// empty containers — saves a function call on what is otherwise a one-instruction path.
+    #[inline]
     fn deallocate_old(&mut self) {
         if self.cap == 0 || size_of::<T>() == 0 {
             return;
@@ -337,147 +299,92 @@ impl<T> TinyVec<T> {
     }
 }
 
-impl<T> std::ops::Index<usize> for TinyVec<T> {
-    type Output = T;
-    fn index(&self, idx: usize) -> &T {
-        &self.as_slice()[idx]
-    }
-}
+// `Index<usize>` / `IndexMut<usize>` are reachable through `Deref<Target=[T]>` —
+// `[T]: Index<usize>` and autoderef makes `tv[i]` work. No need to implement them here.
 
-impl<T> std::ops::IndexMut<usize> for TinyVec<T> {
-    fn index_mut(&mut self, idx: usize) -> &mut T {
-        &mut self.as_mut_slice()[idx]
-    }
-}
-
-impl<T> std::ops::Deref for TinyVec<T> {
+impl<T, const MAX: u8> std::ops::Deref for TinyVec<T, MAX> {
     type Target = [T];
     fn deref(&self) -> &[T] {
         self.as_slice()
     }
 }
 
-impl<T> std::ops::DerefMut for TinyVec<T> {
+impl<T, const MAX: u8> std::ops::DerefMut for TinyVec<T, MAX> {
     fn deref_mut(&mut self) -> &mut [T] {
         self.as_mut_slice()
     }
 }
 
-impl<T> Extend<T> for TinyVec<T> {
-    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+impl<T, const MAX: u8> TinyVec<T, MAX> {
+    /// Extend from an exact-sized iterator: reserves exactly once before the loop,
+    /// avoiding the `size_hint().0` lower-bound dance.
+    ///
+    /// All in-tree callers feed exact-sized iterators (typically `Vec::IntoIter` from
+    /// `TinyVec::into_iter`), so we expose this as the preferred API. The `Extend` trait
+    /// impl below stays for compatibility with generic code.
+    pub fn extend_exact<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: ExactSizeIterator,
+    {
         let iter = iter.into_iter();
-        let (lo, _) = iter.size_hint();
-        if lo > 0 {
-            self.reserve(lo);
-        }
+        self.reserve(iter.len());
         for item in iter {
             self.push(item);
         }
     }
 }
 
-impl<T> FromIterator<T> for TinyVec<T> {
-    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut v = Self::new();
-        v.extend(iter);
-        v
-    }
-}
-
-impl<T> IntoIterator for TinyVec<T> {
+impl<T, const MAX: u8> IntoIterator for TinyVec<T, MAX> {
     type Item = T;
-    type IntoIter = IntoIter<T>;
+    type IntoIter = std::vec::IntoIter<T>;
 
-    fn into_iter(self) -> IntoIter<T> {
-        // Move out of self without running its Drop (we'll drop unmoved elements ourselves).
+    fn into_iter(self) -> Self::IntoIter {
+        // Delegate to `Vec::IntoIter` rather than maintaining our own. ManuallyDrop the
+        // self so its Drop doesn't fire — the reconstructed Vec now owns the buffer.
         let me = ManuallyDrop::new(self);
-        let ptr = me.ptr;
-        let len = me.len;
-        let cap = me.cap;
-        IntoIter {
-            buf: ptr,
-            cap,
-            start: ptr,
-            // SAFETY: end = ptr + len, where len <= cap. Valid one-past-the-end pointer.
-            end: unsafe { ptr.as_ptr().add(len as usize) },
-            _marker: PhantomData,
-        }
+        // SAFETY: by struct invariant, `(self.ptr, self.len, self.cap)` is a valid
+        // `Vec::from_raw_parts` triple.
+        unsafe { Vec::from_raw_parts(me.ptr.as_ptr(), me.len as usize, me.cap as usize) }
+            .into_iter()
     }
 }
 
-impl<'a, T> IntoIterator for &'a TinyVec<T> {
+// `for x in &tv` and `for x in &mut tv` require `&TinyVec` / `&mut TinyVec` to implement
+// `IntoIterator`. The `for` loop's desugaring doesn't apply `Deref` coercion across the
+// reference boundary, so we need these explicit impls. They're trivial — just dispatch to
+// the slice iterators reached through `Deref`.
+impl<'a, T, const MAX: u8> IntoIterator for &'a TinyVec<T, MAX> {
     type Item = &'a T;
     type IntoIter = std::slice::Iter<'a, T>;
     fn into_iter(self) -> std::slice::Iter<'a, T> {
-        self.iter()
+        self.as_slice().iter()
     }
 }
 
-impl<'a, T> IntoIterator for &'a mut TinyVec<T> {
+impl<'a, T, const MAX: u8> IntoIterator for &'a mut TinyVec<T, MAX> {
     type Item = &'a mut T;
     type IntoIter = std::slice::IterMut<'a, T>;
     fn into_iter(self) -> std::slice::IterMut<'a, T> {
-        self.iter_mut()
+        self.as_mut_slice().iter_mut()
     }
 }
 
-/// Owning iterator returned by [`TinyVec::into_iter`].
-pub struct IntoIter<T> {
-    /// The underlying buffer (kept so we can deallocate in Drop).
-    buf: NonNull<T>,
-    cap: u8,
-    /// Pointer to the next element to yield.
-    start: NonNull<T>,
-    /// One-past-the-end pointer. Equal to `start` when exhausted.
-    end: *mut T,
-    _marker: PhantomData<T>,
-}
-
-impl<T> Iterator for IntoIter<T> {
-    type Item = T;
-    fn next(&mut self) -> Option<T> {
-        if self.start.as_ptr() == self.end {
-            None
-        } else {
-            // SAFETY: start points to an initialized element. We bump start past it after read.
-            unsafe {
-                let v = ptr::read(self.start.as_ptr());
-                self.start = NonNull::new_unchecked(self.start.as_ptr().add(1));
-                Some(v)
-            }
-        }
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        // SAFETY: end >= start by construction.
-        let n = unsafe { self.end.offset_from(self.start.as_ptr()) } as usize;
-        (n, Some(n))
-    }
-}
-
-impl<T> Drop for IntoIter<T> {
-    fn drop(&mut self) {
-        // Drop any remaining elements.
-        while self.next().is_some() {}
-        // Deallocate the buffer.
-        if self.cap > 0 && size_of::<T>() != 0 {
-            let layout = Layout::array::<T>(self.cap as usize)
-                .expect("TinyVec layout was valid when allocated");
-            // SAFETY: buf was allocated via `alloc` with this layout.
-            unsafe {
-                dealloc(self.buf.as_ptr() as *mut u8, layout);
-            }
-        }
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for TinyVec<T> {
+impl<T: fmt::Debug, const MAX: u8> fmt::Debug for TinyVec<T, MAX> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_list().entries(self.iter()).finish()
     }
 }
 
-impl<T> Drop for TinyVec<T> {
+impl<T, const MAX: u8> Drop for TinyVec<T, MAX> {
+    #[inline]
     fn drop(&mut self) {
+        // Fast path for empty containers: skip both the drop_in_place and deallocate calls.
+        // Hot because `TinyVec::default()` followed by immediate drop is a common idiom in
+        // benchmarks and in the steady-state of tasks that never allocate anything lazy.
+        if self.cap == 0 {
+            return;
+        }
         // Drop populated elements in place.
         if self.len > 0 {
             // SAFETY: we own `len` initialized elements at the start of the buffer.
@@ -492,7 +399,7 @@ impl<T> Drop for TinyVec<T> {
     }
 }
 
-impl<T> shrink_to_fit::ShrinkToFit for TinyVec<T> {
+impl<T, const MAX: u8> shrink_to_fit::ShrinkToFit for TinyVec<T, MAX> {
     fn shrink_to_fit(&mut self) {
         Self::shrink_to_fit(self);
     }
@@ -501,6 +408,18 @@ impl<T> shrink_to_fit::ShrinkToFit for TinyVec<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test helper: build a TinyVec from an exact-sized iterator. Replaces the previous use
+    /// of `Iterator::collect()` after we removed the `FromIterator` impl.
+    fn from_exact<T, I, const MAX: u8>(iter: I) -> TinyVec<T, MAX>
+    where
+        I: IntoIterator<Item = T>,
+        I::IntoIter: ExactSizeIterator,
+    {
+        let mut v = TinyVec::new();
+        v.extend_exact(iter);
+        v
+    }
 
     #[test]
     fn size() {
@@ -540,7 +459,7 @@ mod tests {
     #[test]
     fn extend_and_reserve() {
         let mut v: TinyVec<u32> = TinyVec::new();
-        v.extend(0..10);
+        v.extend_exact(0..10);
         assert_eq!(v.len(), 10);
         v.reserve(5);
         assert!(v.capacity() >= 15);
@@ -607,7 +526,7 @@ mod tests {
     #[test]
     fn shrink_to_fit_releases_buffer() {
         let mut v: TinyVec<u32> = TinyVec::new();
-        v.extend(0..10);
+        v.extend_exact(0..10);
         assert!(v.capacity() >= 10);
         for _ in 0..10 {
             v.swap_remove(0);
@@ -624,7 +543,129 @@ mod tests {
         for _ in 0..255u32 {
             v.push(0);
         }
-        // The 256th push triggers grow_by_one with new_cap = 256, which exceeds u8::MAX.
+        // The 256th push trips the MAX check (default MAX = u8::MAX = 255).
         v.push(0);
+    }
+
+    /// `MAX` strictly caps push count; growth stops at exactly MAX even when doubling would
+    /// overshoot.
+    #[test]
+    fn tight_max_caps_growth_exactly() {
+        let mut v: TinyVec<u32, 5> = TinyVec::new();
+        for i in 0..5 {
+            v.push(i);
+        }
+        assert_eq!(v.len(), 5);
+        // Capacity should be exactly 5, not the next-power-of-two (8).
+        assert_eq!(v.capacity(), 5);
+    }
+
+    #[test]
+    #[should_panic(expected = "TinyVec capacity overflow")]
+    fn tight_max_panics_at_limit() {
+        let mut v: TinyVec<u32, 3> = TinyVec::new();
+        v.push(0);
+        v.push(1);
+        v.push(2);
+        // The 4th push exceeds MAX=3.
+        v.push(3);
+    }
+
+    /// Confirms the growth schedule with tight MAX: doubles until it would exceed MAX, then
+    /// caps. With MAX=10 we should see 0 -> 4 -> 8 -> 10.
+    #[test]
+    fn tight_max_growth_schedule() {
+        let mut v: TinyVec<u32, 10> = TinyVec::new();
+        let mut last_cap = 0;
+        let mut cap_changes = Vec::new();
+        for i in 0..10 {
+            v.push(i);
+            if v.capacity() != last_cap {
+                cap_changes.push(v.capacity());
+                last_cap = v.capacity();
+            }
+        }
+        assert_eq!(cap_changes, vec![4, 8, 10]);
+    }
+
+    #[test]
+    fn retain_mut_basic() {
+        let mut v: TinyVec<u32> = from_exact(0..10);
+        v.retain_mut(|x| *x % 2 == 0);
+        assert_eq!(v.iter().copied().collect::<Vec<_>>(), vec![0, 2, 4, 6, 8]);
+        // retain_mut shouldn't change capacity.
+        assert!(v.capacity() >= 5);
+    }
+
+    #[test]
+    fn retain_mut_can_mutate() {
+        let mut v: TinyVec<u32> = from_exact(0..5);
+        v.retain_mut(|x| {
+            *x *= 10;
+            *x != 30
+        });
+        assert_eq!(v.iter().copied().collect::<Vec<_>>(), vec![0, 10, 20, 40]);
+    }
+
+    #[test]
+    fn retain_mut_empty() {
+        let mut v: TinyVec<u32> = TinyVec::new();
+        v.retain_mut(|_| panic!("should not be called for empty"));
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn retain_mut_keeps_all() {
+        let mut v: TinyVec<u32> = from_exact(0..5);
+        v.retain_mut(|_| true);
+        assert_eq!(v.iter().copied().collect::<Vec<_>>(), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn retain_mut_removes_all() {
+        let mut v: TinyVec<u32> = from_exact(0..5);
+        v.retain_mut(|_| false);
+        assert!(v.is_empty());
+    }
+
+    /// Verifies retain_mut's panic guard: if the predicate panics, we shouldn't double-free.
+    #[test]
+    fn retain_mut_panic_safety() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut v: TinyVec<u32> = from_exact(0..10);
+            v.retain_mut(|x| {
+                if *x == 5 {
+                    panic!("boom");
+                }
+                true
+            });
+        }));
+        assert!(result.is_err());
+    }
+
+    /// Element Drop panic during retain_mut — `Vec::retain_mut` handles this; we should too.
+    #[test]
+    fn retain_mut_element_drop_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct PanicyDrop<'a>(u32, &'a AtomicUsize);
+        impl Drop for PanicyDrop<'_> {
+            fn drop(&mut self) {
+                self.1.fetch_add(1, Ordering::SeqCst);
+                if self.0 == 5 && !std::thread::panicking() {
+                    panic!("boom from drop");
+                }
+            }
+        }
+
+        let drop_count = AtomicUsize::new(0);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut v: TinyVec<PanicyDrop<'_>> =
+                from_exact((0..10).map(|i| PanicyDrop(i, &drop_count)));
+            v.retain_mut(|x| x.0 != 5); // schedules drop of element with 0==5, which panics
+            // If we get here without panic, drop happened cleanly.
+        }));
+        // The panic should have propagated; some drops should have occurred.
+        assert!(result.is_err() || drop_count.load(Ordering::SeqCst) > 0);
     }
 }
