@@ -21,8 +21,8 @@ use std::{hash::Hash, sync::Arc};
 
 use parking_lot::Mutex;
 use turbo_tasks::{
-    CellId, SharedReference, TaskExecutionReason, TaskId, TraitTypeId, ValueTypeId,
-    backend::{CachedTaskType, CellHash, TransientTaskType},
+    CellId, SharedReference, TaskExecutionReason, TaskId, TinyVec, TraitTypeId, ValueTypeId,
+    backend::{CachedTaskTypeArc, CellHash, TransientTaskType},
     event::Event,
     task_storage,
 };
@@ -30,8 +30,9 @@ use turbo_tasks::{
 use crate::{
     backend::{cell_data::CellData, counter_map::CounterMap},
     data::{
-        ActivenessState, AggregationNumber, CellRef, CollectibleRef, CollectiblesRef, Dirtyness,
-        InProgressCellState, InProgressState, LeafDistance, OutputValue, RootType, TransientTask,
+        ActivenessState, AggregationNumber, CellDependency, CollectibleRef, CollectiblesRef,
+        Dirtyness, InProgressCellState, InProgressState, LeafDistance, OutputValue, RootType,
+        TransientTask,
     },
 };
 
@@ -52,7 +53,7 @@ type AutoMap<K, V> =
 /// - `TaskFlags` bitfield for boolean flags
 /// - Accessor methods and traits
 ///
-/// Fields are stored lazily in `Vec<LazyField>` by default for memory efficiency.
+/// Fields are stored lazily in `TinyVec<LazyField>` by default for memory efficiency.
 /// Fields with `inline` are stored directly on TaskStorage (for hot-path access).
 ///
 /// Note: This struct is consumed by the macro and does not appear in the output.
@@ -249,7 +250,7 @@ struct TaskStorageSchema {
         shrink_on_completion,
         drop_on_completion_if_immutable
     )]
-    cell_dependencies: AutoSet<(CellRef, Option<u64>)>,
+    cell_dependencies: AutoSet<CellDependency>,
 
     /// Collectibles this task depends on.
     #[field(
@@ -267,7 +268,7 @@ struct TaskStorageSchema {
 
     /// Outdated cell dependencies to be cleaned up (transient).
     #[field(storage = "auto_set", category = "transient", shrink_on_completion)]
-    outdated_cell_dependencies: AutoSet<(CellRef, Option<u64>)>,
+    outdated_cell_dependencies: AutoSet<CellDependency>,
 
     /// Outdated collectibles dependencies to be cleaned up (transient).
     #[field(storage = "auto_set", category = "transient", shrink_on_completion)]
@@ -282,7 +283,7 @@ struct TaskStorageSchema {
         filter_transient,
         drop_on_completion_if_immutable
     )]
-    cell_dependents: AutoSet<(CellId, Option<u64>, TaskId)>,
+    cell_dependents: AutoSet<CellDependency>,
 
     /// Tasks that depend on collectibles of a specific type from this task.
     /// Maps TraitTypeId -> Set<TaskId>
@@ -329,7 +330,7 @@ struct TaskStorageSchema {
     in_progress_cells: AutoMap<CellId, InProgressCellState>,
 
     #[field(storage = "direct", category = "data", inline)]
-    pub persistent_task_type: Option<Arc<CachedTaskType>>,
+    pub persistent_task_type: Option<CachedTaskTypeArc>,
 
     #[field(storage = "direct", category = "transient")]
     pub transient_task_type: Arc<TransientTask>,
@@ -522,7 +523,7 @@ impl TaskStorage {
                 None => KeyEvictability::Unevictable,
                 // strong_count == 1: only this TaskStorage holds this Arc, so no task_cache entry
                 // references it. It must have been already evicted on a prior cycle.
-                Some(arc) if Arc::strong_count(arc) == 1 => KeyEvictability::AlreadyEvicted,
+                Some(arc) if arc.count() == 1 => KeyEvictability::AlreadyEvicted,
                 Some(_) => KeyEvictability::Evictable,
             }
         };
@@ -844,14 +845,9 @@ impl IsTransient for (TraitTypeId, TaskId) {
         self.1.is_transient()
     }
 }
-impl IsTransient for (CellId, Option<u64>, TaskId) {
+impl IsTransient for CellDependency {
     fn is_transient(&self) -> bool {
-        self.2.is_transient()
-    }
-}
-impl IsTransient for (CellRef, Option<u64>) {
-    fn is_transient(&self) -> bool {
-        self.0.task.is_transient()
+        CellDependency::is_transient(self)
     }
 }
 
@@ -956,7 +952,7 @@ mod tests {
     use turbo_tasks::{CellId, TaskId};
 
     use super::*;
-    use crate::data::{AggregationNumber, CellRef, Dirtyness, OutputValue};
+    use crate::data::{AggregationNumber, CellDependency, CellRef, Dirtyness, OutputValue};
 
     #[test]
     fn test_accessors() {
@@ -1242,16 +1238,15 @@ mod tests {
         original
             .output_dependencies_mut()
             .insert(TaskId::new(200).unwrap());
-        original.cell_dependencies_mut().insert((
-            CellRef {
+        original
+            .cell_dependencies_mut()
+            .insert(CellDependency::All(CellRef {
                 task: TaskId::new(1).unwrap(),
                 cell: CellId {
                     type_id: unsafe { turbo_tasks::ValueTypeId::new_unchecked(1) },
                     index: 0,
                 },
-            },
-            None,
-        ));
+            }));
 
         // Set lazy data transient field (should NOT be serialized)
         original
@@ -1390,16 +1385,15 @@ mod tests {
         storage.output_dependent_mut().insert(transient_task(3));
 
         // Lazy filter_transient data field.
-        storage.cell_dependencies_mut().insert((
-            CellRef {
+        storage
+            .cell_dependencies_mut()
+            .insert(CellDependency::All(CellRef {
                 task: persistent_task(10),
                 cell: CellId {
                     type_id: unsafe { turbo_tasks::ValueTypeId::new_unchecked(1) },
                     index: 0,
                 },
-            },
-            None,
-        ));
+            }));
 
         // Mark as restored so the task is eligible for dropping.
         storage.flags.set_data_restored(true);
@@ -1705,13 +1699,14 @@ mod tests {
     fn test_schema_size() {
         assert_eq!(
             size_of::<TaskStorage>(),
-            136,
-            "TaskStorage size changed! If this is intentional, update this test."
+            128,
+            "TaskStorage size changed! Run print_schema_sizes and update this test."
         );
+        // `LazyField` is 48 B = 40 B largest payload + 8 B discriminant.
         assert_eq!(
             size_of::<LazyField>(),
-            56,
-            "LazyField size changed! If this is intentional, update this test."
+            48,
+            "LazyField size changed! Run print_schema_sizes and update this test."
         );
     }
 }

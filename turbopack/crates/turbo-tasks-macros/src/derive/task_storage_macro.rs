@@ -1296,12 +1296,12 @@ fn generate_typed_storage_struct(grouped_fields: &GroupedFields) -> TokenStream 
         quote! {}
     };
 
-    // Add lazy vec field if needed (pub(crate) - used by helper methods)
-    // Note: Serialization is handled manually via encode_data/encode_meta methods
+    // `TinyVec` is resolved at the schema's call site — the schema must
+    // `use turbo_tasks::TinyVec` (or otherwise have it in scope).
     let lazy_field = if has_lazy {
         quote! {
-            #[doc = "Lazily-allocated fields stored in a single Vec for memory efficiency"]
-            lazy: Vec<LazyField>,
+            #[doc = "Lazily-allocated fields stored in a compact TinyVec for memory efficiency"]
+            lazy: TinyVec<LazyField>,
         }
     } else {
         quote! {}

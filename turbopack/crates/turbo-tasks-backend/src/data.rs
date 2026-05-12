@@ -77,6 +77,66 @@ impl CollectiblesRef {
     }
 }
 
+/// An edge between a [`CellRef`] and a task, optionally narrowed by a hashed sub-key.
+///
+/// Used both as a forward and reverse edge:
+/// - In `cell_dependencies`, the [`CellRef`] is the cell another task owns that this task depends
+///   on.
+/// - In `cell_dependents`, the [`CellRef`]'s `task` is the dependent task and `cell` is the cell of
+///   the storing task; the `task` field is reused as the dependent's id rather than the cell's
+///   owning task. The fields encode the same bits either way.
+///
+/// Replaces the old `(CellRef, Option<u64>)` and `(CellId, Option<u64>, TaskId)` tuples. The
+/// `Option<u64>` previously cost a full 16 B (8 B discriminant + 8 B value, aligned). With an
+/// explicit enum the layout algorithm reuses the niche on `ValueTypeId` (`NonZero<u16>`)
+/// inside `CellRef.cell.type_id` for the variant tag, dropping the element from 32 B to 24 B.
+/// That in turn shrinks `LazyField` from 56 B to 48 B.
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, Encode, Decode)]
+pub enum CellDependency {
+    /// Depend on the cell as a whole.
+    All(CellRef),
+    /// Depend only on the sub-value identified by this hash key.
+    Hash(CellRef, u64),
+}
+
+impl CellDependency {
+    pub fn cell_ref(&self) -> CellRef {
+        match *self {
+            CellDependency::All(c) | CellDependency::Hash(c, _) => c,
+        }
+    }
+
+    pub fn key(&self) -> Option<u64> {
+        match *self {
+            CellDependency::All(_) => None,
+            CellDependency::Hash(_, k) => Some(k),
+        }
+    }
+
+    /// Decompose into the underlying `(CellRef, Option<u64>)` in a single match.
+    ///
+    /// Prefer this over back-to-back `cell_ref()` + `key()` calls — the discriminant is
+    /// checked once instead of twice, which is meaningful in hot loops over
+    /// `iter_cell_dependents` / `iter_cell_dependencies`.
+    pub fn into_parts(self) -> (CellRef, Option<u64>) {
+        match self {
+            CellDependency::All(c) => (c, None),
+            CellDependency::Hash(c, k) => (c, Some(k)),
+        }
+    }
+
+    pub fn new(cell_ref: CellRef, key: Option<u64>) -> Self {
+        match key {
+            None => CellDependency::All(cell_ref),
+            Some(k) => CellDependency::Hash(cell_ref, k),
+        }
+    }
+
+    pub fn is_transient(&self) -> bool {
+        self.cell_ref().is_transient()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
 pub enum OutputValue {
     Cell(CellRef),
