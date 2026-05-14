@@ -1576,11 +1576,6 @@ export default async function getBaseWebpackConfig(
           : []),
 
         ...getNextRootParamsRules({
-          isRootParamsEnabled:
-            config.experimental.rootParams ??
-            // `cacheComponents` implies `experimental.rootParams`.
-            config.cacheComponents ??
-            false,
           isClient,
           appDir,
           pageExtensions,
@@ -2866,12 +2861,10 @@ export default async function getBaseWebpackConfig(
 }
 
 function getNextRootParamsRules({
-  isRootParamsEnabled,
   isClient,
   appDir,
   pageExtensions,
 }: {
-  isRootParamsEnabled: boolean
   isClient: boolean
   appDir: string | undefined
   pageExtensions: string[]
@@ -2887,15 +2880,6 @@ function getNextRootParamsRules({
         message,
       } satisfies InvalidImportLoaderOpts,
     } satisfies webpack.RuleSetRule
-  }
-
-  // Hard-error if the flag is not enabled, regardless of if we're on the server or on the client.
-  if (!isRootParamsEnabled) {
-    return [
-      createInvalidImportRule(
-        "'next/root-params' can only be imported when `experimental.rootParams` is enabled."
-      ),
-    ]
   }
 
   // If there's no app-dir (and thus no layouts), there's no sensible way to use 'next/root-params',
