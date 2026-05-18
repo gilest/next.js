@@ -65,7 +65,7 @@ impl VcStorage {
         let task_id = TaskId::try_from(u32::try_from(i + 1).unwrap()).unwrap();
         let execution_id = ExecutionId::try_from(u16::try_from(i + 1).unwrap()).unwrap();
         handle.spawn(with_turbo_tasks_for_testing(
-            this.clone(),
+            this.clone().make_handle(),
             task_id,
             execution_id,
             async move {
@@ -325,14 +325,26 @@ impl TurboTasksApi for VcStorage {
 
 impl VcStorage {
     pub fn with<T>(f: impl Future<Output = T>) -> impl Future<Output = T> {
-        with_turbo_tasks_for_testing(
-            Arc::new_cyclic(|weak| VcStorage {
-                this: weak.clone(),
-                ..Default::default()
-            }),
-            TaskId::MAX,
-            ExecutionId::MIN,
-            f,
-        )
+        let arc = Arc::new_cyclic(|weak| VcStorage {
+            this: weak.clone(),
+            ..Default::default()
+        });
+        with_turbo_tasks_for_testing(arc.make_handle(), TaskId::MAX, ExecutionId::MIN, f)
+    }
+
+    /// Builds a [`turbo_tasks::TurboTasksHandle`] that points at this
+    /// `VcStorage`. Consumes one strong refcount; the handle drops it when
+    /// dropped.
+    pub fn make_handle(self: Arc<Self>) -> turbo_tasks::TurboTasksHandle {
+        let ptr = Arc::into_raw(self) as *mut ();
+        // Safety: `ptr` came from `Arc::into_raw` on a `VcStorage`, which
+        // `turbo-tasks-handle`'s `__tt_test_*` providers know how to cast
+        // back to. Tag is consistent with the test arm.
+        unsafe {
+            turbo_tasks::TurboTasksHandle::from_raw_parts(
+                turbo_tasks::HandleTag::Test,
+                std::ptr::NonNull::new_unchecked(ptr),
+            )
+        }
     }
 }

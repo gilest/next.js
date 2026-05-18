@@ -371,7 +371,7 @@ pub struct TurboTasksError {
 /// [`TurboTasksCallApi::get_task_name`]) rather than eagerly at error creation time.
 #[derive(Clone)]
 pub struct TurboTaskContextError {
-    pub turbo_tasks: Arc<dyn TurboTasksCallApi>,
+    pub turbo_tasks: crate::TurboTasksHandle,
     pub task_id: TaskId,
     pub source: Option<TurboTasksExecutionError>,
 }
@@ -434,11 +434,7 @@ pub enum TurboTasksExecutionError {
 impl TurboTasksExecutionError {
     /// Wraps this error in a [`TaskContext`](TurboTasksExecutionError::TaskContext) layer
     /// identifying the normal task that encountered the error.
-    pub fn with_task_context(
-        self,
-        task_id: TaskId,
-        turbo_tasks: Arc<dyn TurboTasksCallApi>,
-    ) -> Self {
+    pub fn with_task_context(self, task_id: TaskId, turbo_tasks: crate::TurboTasksHandle) -> Self {
         TurboTasksExecutionError::TaskContext(Arc::new(TurboTaskContextError {
             task_id,
             turbo_tasks,

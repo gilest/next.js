@@ -124,7 +124,7 @@ impl DevServer {
 impl DevServerBuilder {
     pub fn serve(
         self,
-        turbo_tasks: Arc<dyn TurboTasksApi>,
+        turbo_tasks: turbo_tasks::TurboTasksHandle,
         source_provider: impl SourceProvider + NonLocalValue + TraceRawVcs + Sync,
         get_issue_reporter: Arc<dyn Fn() -> Vc<Box<dyn IssueReporter>> + Send + Sync>,
     ) -> DevServer {
@@ -195,7 +195,7 @@ impl DevServerBuilder {
                                         hyper_tungstenite::upgrade(request, None)?;
                                     let update_server =
                                         UpdateServer::new(source_provider, issue_reporter);
-                                    update_server.run(&*tt, websocket);
+                                    update_server.run(&tt, websocket);
                                     return Ok(response);
                                 }
 
