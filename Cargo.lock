@@ -10022,7 +10022,10 @@ dependencies = [
 name = "turbo-tasks-handle"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "either",
+ "smallvec",
+ "tokio",
  "turbo-tasks",
  "turbo-tasks-backend",
  "turbo-tasks-testing",
